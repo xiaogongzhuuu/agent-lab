@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Agent Trace Studio",
-  description: "实时展示 Agent 接收问题、循环调用工具并生成结构化结果的执行台。",
+  title: "Agent Trace Lab",
+  description: "逐步学习 Tool Calling 与 ReAct 循环的交互实验室。",
   other: {
     "codex-preview": "development",
   },
