@@ -1,16 +1,15 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import "./redesign.css";
 
 export const metadata: Metadata = {
-  title: "Agent Trace Lab",
+  title: "Agent 调用可视化平台",
   description: "逐步学习 Tool Calling 与 ReAct 循环的交互实验室。",
   other: {
     "codex-preview": "development",
   },
   icons: {
-    icon: "/favicon.svg",
-    shortcut: "/favicon.svg",
+    icon: "/favicon.svg?v=3",
+    shortcut: "/favicon.svg?v=3",
   },
 };
 
