@@ -545,7 +545,7 @@ export default function Home() {
           </span>
           <div>
             <strong>Agent Trace</strong>
-            <span>Lab</span>
+            <span>实验台</span>
           </div>
         </div>
         <div className="model-pill">
@@ -568,8 +568,8 @@ export default function Home() {
           <div className="panel-title">
             <span>01</span>
             <div>
-              <h2>任务输入</h2>
-              <p>定义 Agent 要解决的问题</p>
+              <h2>设置任务</h2>
+              <p>输入问题，选择运行方式</p>
             </div>
           </div>
           <div className="mode-picker">
@@ -598,34 +598,6 @@ export default function Home() {
                 : "组装输入、模型返回、工具执行都逐步确认。"}
             </p>
           </div>
-          <div className="experiment-panel">
-            <div className="experiment-heading">
-              <span className="section-label">实验一 · 工具选择</span>
-              <Badge variant="outline">单变量</Badge>
-            </div>
-            <RadioGroup
-              value={experimentVariant}
-              onValueChange={(value) => {
-                setExperimentVariant(value as ExperimentVariant);
-                resetDemo();
-              }}
-              disabled={running || manualSession}
-            >
-              {experimentOptions.map((option) => (
-                <label
-                  key={option.value}
-                  className={`experiment-option ${experimentVariant === option.value ? "selected" : ""}`}
-                >
-                  <RadioGroupItem value={option.value} />
-                  <span>
-                    <strong>{option.title}</strong>
-                    <small>{option.detail}</small>
-                  </span>
-                </label>
-              ))}
-            </RadioGroup>
-            <p>改变工具描述和顺序，观察相同问题下 DeepSeek 返回哪个 tool_call。</p>
-          </div>
           <div className="prompt-card">
             <label htmlFor="question">用户问题</label>
             <Textarea
@@ -640,20 +612,6 @@ export default function Home() {
               <span>{question.length} 字符</span>
               <span>{mode === "manual" ? "逐步确认" : "自动执行"}</span>
             </div>
-          </div>
-          <div className="suggestions">
-            <span className="section-label">测试案例 · {suggestions.length}</span>
-            {suggestions.map((suggestion, index) => (
-              <button
-                key={suggestion}
-                onClick={() => setQuestion(suggestion)}
-                disabled={running || manualSession}
-              >
-                <span>0{index + 1}</span>
-                {suggestion}
-                <ArrowUp />
-              </button>
-            ))}
           </div>
           <div className="run-area">
             <Button
@@ -703,14 +661,56 @@ export default function Home() {
               <FlaskConical /> 工具结果为预设数据，工具选择和参数由模型决定
             </p>
           </div>
+          <div className="experiment-panel">
+            <div className="experiment-heading">
+              <span className="section-label">实验一 · 工具选择</span>
+              <Badge variant="outline">单变量</Badge>
+            </div>
+            <RadioGroup
+              value={experimentVariant}
+              onValueChange={(value) => {
+                setExperimentVariant(value as ExperimentVariant);
+                resetDemo();
+              }}
+              disabled={running || manualSession}
+            >
+              {experimentOptions.map((option) => (
+                <label
+                  key={option.value}
+                  className={`experiment-option ${experimentVariant === option.value ? "selected" : ""}`}
+                >
+                  <RadioGroupItem value={option.value} />
+                  <span>
+                    <strong>{option.title}</strong>
+                    <small>{option.detail}</small>
+                  </span>
+                </label>
+              ))}
+            </RadioGroup>
+            <p>改变工具描述和顺序，观察相同问题下 DeepSeek 返回哪个 tool_call。</p>
+          </div>
+          <div className="suggestions">
+            <span className="section-label">试试这些问题 · {suggestions.length}</span>
+            {suggestions.map((suggestion, index) => (
+              <button
+                key={suggestion}
+                onClick={() => setQuestion(suggestion)}
+                disabled={running || manualSession}
+              >
+                <span>0{index + 1}</span>
+                {suggestion}
+                <ArrowUp />
+              </button>
+            ))}
+          </div>
         </aside>
         <section className="trace-panel">
           <div className="trace-header">
             <div className="panel-title">
               <span>02</span>
               <div>
-                <h2>ReAct 循环</h2>
-                <p>组装输入 → 模型决策 → Tool Call → Observation</p>
+                <h2>执行轨迹</h2>
+                <p>观察模型如何选择工具、使用结果并继续判断</p>
               </div>
             </div>
             <div className="run-stats">
@@ -732,8 +732,14 @@ export default function Home() {
             ) : (
               <div className="empty-trace">
                 <Bot />
-                <h3>等待运行</h3>
-                <p>模型会自主选择工具并循环处理工具结果。</p>
+                <h3>从一个问题开始</h3>
+                <p>运行后，这里会按时间顺序展示可观察的 ReAct 循环。</p>
+                <div className="empty-flow" aria-label="ReAct 循环步骤">
+                  <span>模型决策</span>
+                  <span>工具调用</span>
+                  <span>观察结果</span>
+                  <span>继续判断</span>
+                </div>
               </div>
             )}
             {running ? (
@@ -796,8 +802,8 @@ export default function Home() {
             <div className="panel-title">
               <span>03</span>
               <div>
-                <h2>最终结果</h2>
-                <p>可直接消费的 JSON 结构</p>
+                <h2>结论与证据</h2>
+                <p>循环结束后生成结构化建议</p>
               </div>
             </div>
             <button
