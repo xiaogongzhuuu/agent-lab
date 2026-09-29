@@ -1,38 +1,22 @@
 "use client";
 
-import { useRef, useState, type ReactNode } from "react";
-import { Brain, Minimize2, PanelLeftClose, PanelLeftOpen, Workflow } from "lucide-react";
+import { useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { ArchitectureDiagram } from "./components/architecture-diagram";
+import { TraceFields, TraceInspector, type TraceSelection } from "./components/trace-fields";
+import { buildTraceLinks, type TraceEvent as AgentEvent } from "@/lib/trace-links";
+import {
+  Brain,
+  ChevronLeft,
+  ChevronRight,
+  Minimize2,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Workflow,
+} from "lucide-react";
 
 type ToolDraft = { id: string; name: string; description: string; resultText: string };
-type ModelEvent = {
-  type: "model";
-  round: number;
-  purpose?: "decision" | "summary";
-  used_tools?: string[];
-  request: unknown;
-  response: unknown;
-  status: number;
-};
-type ToolEvent = {
-  type: "tool";
-  round: number;
-  name: string;
-  arguments: unknown;
-  observation: unknown;
-  appended_message: unknown;
-  next?: string;
-};
-type PlanEvent = {
-  type: "plan";
-  source: "fixed" | "model";
-  steps: Array<{ name: string; input: string }>;
-  request?: unknown;
-  response?: unknown;
-  status?: number;
-};
-type FinalEvent = { type: "final"; answer: string; reason: string };
-type ErrorEvent = { type: "error"; message: string };
-type AgentEvent = ModelEvent | ToolEvent | PlanEvent | FinalEvent | ErrorEvent;
+type ModelEvent = Extract<AgentEvent, { type: "model" }>;
+type ToolEvent = Extract<AgentEvent, { type: "tool" }>;
 type Architecture = "react" | "fixed" | "plan";
 type Example = "basic" | "conditional" | "custom";
 type RunRecord = {
@@ -52,12 +36,12 @@ const emptyRuns = (): Record<Architecture, RunRecord | null> => ({
   fixed: null,
   plan: null,
 });
-const basicQuery = "我需要调用 a、b，然后总结结果。";
+const basicQuery = "先调用 a，拿到结果后再调用 b，最后总结。";
 const conditionalQuery =
   "先调用 a；仅当 a 返回的 need_b 为 true 时，再调用 b。最后根据实际结果总结。";
 
 const architectureNotes: Record<Architecture, string> = {
-  react: "看一次结果，再决定下一步。",
+  react: "每轮一个工具，观察后再决定；工具不重复。",
   fixed: "按工具列表顺序，执行任务中点名的工具。",
   plan: "模型先列出步骤，再依次执行。",
 };
@@ -67,6 +51,38 @@ const modules = [
   { name: "上下文压缩", icon: Minimize2, current: false },
   { name: "长期记忆", icon: Brain, current: false },
 ] as const;
+
+const sidebarPreferenceKey = "agent-lab.sidebar-collapsed";
+const sidebarListeners = new Set<() => void>();
+let sidebarPreference: boolean | undefined;
+
+function readSidebarPreference() {
+  if (sidebarPreference === undefined) {
+    try {
+      sidebarPreference = localStorage.getItem(sidebarPreferenceKey) === "true";
+    } catch {
+      sidebarPreference = false;
+    }
+  }
+  return sidebarPreference;
+}
+
+function subscribeSidebarPreference(listener: () => void) {
+  sidebarListeners.add(listener);
+  return () => {
+    sidebarListeners.delete(listener);
+  };
+}
+
+function saveSidebarPreference(collapsed: boolean) {
+  sidebarPreference = collapsed;
+  try {
+    localStorage.setItem(sidebarPreferenceKey, String(collapsed));
+  } catch {
+    // Keep the choice in memory when browser storage is unavailable.
+  }
+  sidebarListeners.forEach((listener) => listener());
+}
 
 const initialTools: ToolDraft[] = [
   { id: "a", name: "a", description: "用户要求调用 a 时使用", resultText: '{"value":"A 的结果"}' },
@@ -124,16 +140,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function compact(value: unknown): string {
-  const record = asRecord(value);
-  if (record && Object.keys(record).length === 1) {
-    if (typeof record.input === "string") return record.input;
-    if (typeof record.value === "string") return record.value;
-  }
-  if (typeof value === "string") return value;
-  return JSON.stringify(value) ?? String(value);
-}
-
 function modelSummary(event: ModelEvent) {
   const request = asRecord(event.request);
   const messages = Array.isArray(request?.messages) ? request.messages : [];
@@ -178,88 +184,6 @@ function RawDetails({ children }: { children: ReactNode }) {
   );
 }
 
-function DiagramNode({
-  children,
-  tone = "neutral",
-}: {
-  children: ReactNode;
-  tone?: "neutral" | "model" | "plan" | "tool" | "answer";
-}) {
-  return <span className={`diagram-node diagram-node-${tone}`}>{children}</span>;
-}
-
-function DiagramArrow() {
-  return (
-    <span className="diagram-arrow" aria-hidden="true">
-      →
-    </span>
-  );
-}
-
-function ArchitectureDiagram({ architecture }: { architecture: Architecture }) {
-  return (
-    <section className="architecture-diagram" aria-labelledby="architecture-diagram-title">
-      <div className="architecture-diagram-heading">
-        <h2 id="architecture-diagram-title">架构图</h2>
-        <span>{architectureNames[architecture]}</span>
-      </div>
-      {architecture === "react" ? (
-        <div className="diagram-canvas">
-          <div className="diagram-line">
-            <DiagramNode>用户问题</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="model">模型决策</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="answer">无需工具则回答</DiagramNode>
-          </div>
-          <div className="diagram-loop">
-            <span className="diagram-branch-label">需要工具时 ↓</span>
-            <div className="diagram-line diagram-loop-line">
-              <DiagramNode tone="tool">调用工具</DiagramNode>
-              <DiagramArrow />
-              <DiagramNode>观察结果</DiagramNode>
-              <span className="diagram-return">↶ 带结果回到模型决策</span>
-            </div>
-          </div>
-          <p className="diagram-caption">无需工具时直接回答；需要工具时进入下一轮。</p>
-        </div>
-      ) : architecture === "fixed" ? (
-        <div className="diagram-canvas">
-          <div className="diagram-line">
-            <DiagramNode>用户问题</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="plan">规则选工具</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="tool">依次执行</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="model">模型总结</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="answer">最终结论</DiagramNode>
-          </div>
-          <p className="diagram-caption">工具顺序在执行前确定。</p>
-        </div>
-      ) : (
-        <div className="diagram-canvas">
-          <div className="diagram-line">
-            <DiagramNode>用户问题</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="model">模型规划</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="plan">计划清单</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="tool">依次执行</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="model">模型总结</DiagramNode>
-            <DiagramArrow />
-            <DiagramNode tone="answer">最终结论</DiagramNode>
-          </div>
-          <p className="diagram-caption">模型先定计划，执行中不重新规划。</p>
-        </div>
-      )}
-    </section>
-  );
-}
-
 export default function Home() {
   const [query, setQuery] = useState(basicQuery);
   const [architecture, setArchitecture] = useState<Architecture>("react");
@@ -270,9 +194,22 @@ export default function Home() {
   const [running, setRunning] = useState(false);
   const [runningMode, setRunningMode] = useState<Architecture | null>(null);
   const [inputError, setInputError] = useState("");
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const sidebarCollapsed = useSyncExternalStore(
+    subscribeSidebarPreference,
+    readSidebarPreference,
+    () => false,
+  );
+  const [setupCollapsed, setSetupCollapsed] = useState(false);
+  const [inspection, setInspection] = useState<{
+    architecture: Architecture;
+    selection: TraceSelection;
+  } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const runIdRef = useRef(0);
+
+  function toggleSidebar() {
+    saveSidebarPreference(!sidebarCollapsed);
+  }
 
   function updateTool(id: string, field: "name" | "description" | "resultText", value: string) {
     setTools((current) =>
@@ -309,6 +246,7 @@ export default function Home() {
   }
 
   function resetTrace() {
+    setInspection(null);
     runIdRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
@@ -319,6 +257,7 @@ export default function Home() {
   }
 
   async function runModes(modes: Architecture[]) {
+    setInspection(null);
     if (running) return;
     setInputError("");
     let configuredTools: Array<{ name: string; description: string; result: unknown }>;
@@ -435,10 +374,44 @@ export default function Home() {
   const modelCount = modelCalls(events);
   const toolCount = calledTools(events).length;
   const hasRuns = architectures.some((mode) => runs[mode] !== null);
+  const traceLinks = buildTraceLinks(events);
+  const inspectionEvents = inspection ? (runs[inspection.architecture]?.events ?? []) : [];
+  const inspectionLinks = inspection ? buildTraceLinks(inspectionEvents) : [];
+
+  function inspectField(selection: TraceSelection) {
+    setInspection({ architecture, selection });
+  }
+
+  function locateTrace(index: number) {
+    if (!inspection) return;
+    const mode = inspection.architecture;
+    setArchitecture(mode);
+    requestAnimationFrame(() => {
+      const target = document.getElementById(`trace-${mode}-${index}`);
+      const details = target?.querySelector("details.raw-details");
+      if (details instanceof HTMLDetailsElement) details.open = true;
+      target?.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+        block: "center",
+      });
+      target?.focus({ preventScroll: true });
+    });
+  }
 
   return (
     <main className="app">
       <header className="header">
+        <button
+          className="sidebar-toggle"
+          type="button"
+          aria-label={sidebarCollapsed ? "展开功能栏" : "收起功能栏"}
+          aria-expanded={!sidebarCollapsed}
+          aria-controls="module-navigation"
+          title={sidebarCollapsed ? "展开功能栏" : "收起功能栏"}
+          onClick={toggleSidebar}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen size={19} /> : <PanelLeftClose size={19} />}
+        </button>
         <div className="brand-mark" aria-hidden="true">
           ↻
         </div>
@@ -450,20 +423,8 @@ export default function Home() {
       </header>
 
       <div className={`workspace${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
-        <nav className="module-sidebar" aria-label="功能导航">
-          <div className="module-sidebar-heading">
-            <span className="module-sidebar-label">功能模块</span>
-            <button
-              className="sidebar-toggle"
-              type="button"
-              aria-label={sidebarCollapsed ? "展开功能栏" : "收起功能栏"}
-              aria-expanded={!sidebarCollapsed}
-              title={sidebarCollapsed ? "展开功能栏" : "收起功能栏"}
-              onClick={() => setSidebarCollapsed((value) => !value)}
-            >
-              {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
-            </button>
-          </div>
+        <nav className="module-sidebar" aria-label="功能导航" id="module-navigation">
+          <span className="module-sidebar-label">功能模块</span>
           <div className="module-nav">
             {modules.map((module) => {
               const Icon = module.icon;
@@ -474,7 +435,7 @@ export default function Home() {
                   key={module.name}
                   aria-current={module.current ? "page" : undefined}
                   aria-label={module.current ? module.name : `${module.name}，规划中`}
-                  title={sidebarCollapsed ? module.name : undefined}
+                  title={module.current ? module.name : `${module.name} · 规划中`}
                   disabled={!module.current}
                   onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
                 >
@@ -486,189 +447,213 @@ export default function Home() {
             })}
           </div>
         </nav>
-        <div className="layout">
+        <div className={`layout${setupCollapsed ? " setup-collapsed" : ""}`}>
           <aside className="setup">
-            <div className="section-title">
+            <div className="section-title setup-heading">
               <h1>任务与工具</h1>
-            </div>
-            <div className="example-picker" aria-label="示例任务">
-              <span>示例</span>
               <button
+                className="sidebar-toggle setup-toggle"
                 type="button"
-                className={example === "basic" ? "selected" : ""}
-                onClick={() => loadExample("basic")}
-                disabled={running}
+                aria-label={setupCollapsed ? "展开任务配置" : "收起任务配置"}
+                aria-expanded={!setupCollapsed}
+                aria-controls="setup-fields"
+                title={setupCollapsed ? "展开任务配置" : "收起任务配置"}
+                onClick={() => setSetupCollapsed((value) => !value)}
               >
-                基础
-              </button>
-              <button
-                type="button"
-                className={example === "conditional" ? "selected" : ""}
-                onClick={() => loadExample("conditional")}
-                disabled={running}
-              >
-                条件任务
+                {setupCollapsed ? <ChevronRight size={18} /> : <ChevronLeft size={18} />}
+                <span className="setup-toggle-label" aria-hidden="true">
+                  任务配置
+                </span>
               </button>
             </div>
-            <label className="field">
-              <span>任务</span>
-              <textarea
-                value={query}
-                onChange={(event) => {
-                  setQuery(event.target.value);
-                  setExample("custom");
-                  setRuns(emptyRuns());
-                }}
-                disabled={running}
-                rows={4}
-              />
-            </label>
-            {example === "conditional" ? (
-              <label className="field condition-field">
-                <span>a 的返回结果</span>
-                <select
-                  value={needsB ? "true" : "false"}
-                  onChange={(event) => changeCondition(event.target.value === "true")}
+            <div id="setup-fields" hidden={setupCollapsed}>
+              <div className="example-picker" aria-label="示例任务">
+                <span>示例</span>
+                <button
+                  type="button"
+                  className={example === "basic" ? "selected" : ""}
+                  onClick={() => loadExample("basic")}
                   disabled={running}
                 >
-                  <option value="false">不需要调用 b</option>
-                  <option value="true">需要调用 b</option>
-                </select>
-                <small>ReAct 会看结果再决定；其他架构先定步骤。</small>
+                  基础
+                </button>
+                <button
+                  type="button"
+                  className={example === "conditional" ? "selected" : ""}
+                  onClick={() => loadExample("conditional")}
+                  disabled={running}
+                >
+                  条件任务
+                </button>
+              </div>
+              <label className="field">
+                <span>任务</span>
+                <textarea
+                  value={query}
+                  onChange={(event) => {
+                    setQuery(event.target.value);
+                    setExample("custom");
+                    setRuns(emptyRuns());
+                  }}
+                  disabled={running}
+                  rows={4}
+                />
               </label>
-            ) : null}
-            <label className="field architecture-field">
-              <span>架构</span>
-              <select
-                value={architecture}
-                onChange={(event) => setArchitecture(event.target.value as Architecture)}
-                disabled={running}
-              >
-                <option value="react">ReAct 循环</option>
-                <option value="fixed">固定流程</option>
-                <option value="plan">先计划后执行</option>
-              </select>
-              <small>{architectureNotes[architecture]}</small>
-            </label>
-            <div className="setup-actions">
-              <button
-                className="primary-button"
-                type="button"
-                onClick={() => runModes([architecture])}
-                disabled={running}
-              >
-                {running
-                  ? `运行中：${architectureNames[runningMode ?? architecture]}`
-                  : "运行当前架构"}
-              </button>
-              <button
-                className="subtle-button compare-button"
-                type="button"
-                onClick={() => runModes(architectures)}
-                disabled={running}
-              >
-                对照三种架构
-              </button>
-              {running ? (
+              {example === "conditional" ? (
+                <label className="field condition-field">
+                  <span>a 的返回结果</span>
+                  <select
+                    value={needsB ? "true" : "false"}
+                    onChange={(event) => changeCondition(event.target.value === "true")}
+                    disabled={running}
+                  >
+                    <option value="false">不需要调用 b</option>
+                    <option value="true">需要调用 b</option>
+                  </select>
+                  <small>ReAct 会看结果再决定；其他架构先定步骤。</small>
+                </label>
+              ) : null}
+              <label className="field architecture-field">
+                <span>架构</span>
+                <select
+                  value={architecture}
+                  onChange={(event) => setArchitecture(event.target.value as Architecture)}
+                  disabled={running}
+                >
+                  <option value="react">ReAct 循环</option>
+                  <option value="fixed">固定流程</option>
+                  <option value="plan">先计划后执行</option>
+                </select>
+                <small>{architectureNotes[architecture]}</small>
+              </label>
+              <div className="setup-actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => runModes([architecture])}
+                  disabled={running}
+                >
+                  {running
+                    ? `运行中：${architectureNames[runningMode ?? architecture]}`
+                    : "运行当前架构"}
+                </button>
+                <button
+                  className="subtle-button compare-button"
+                  type="button"
+                  onClick={() => runModes(architectures)}
+                  disabled={running}
+                >
+                  对照三种架构
+                </button>
+                {running ? (
+                  <button
+                    className="subtle-button"
+                    type="button"
+                    onClick={() => abortRef.current?.abort()}
+                  >
+                    停止
+                  </button>
+                ) : null}
                 <button
                   className="subtle-button"
                   type="button"
-                  onClick={() => abortRef.current?.abort()}
+                  onClick={resetTrace}
+                  disabled={!hasRuns}
                 >
-                  停止
+                  清空结果
                 </button>
-              ) : null}
-              <button className="subtle-button" type="button" onClick={resetTrace}>
-                清空结果
-              </button>
-            </div>
-            {inputError ? (
-              <p className="input-error" role="alert">
-                {inputError}
-              </p>
-            ) : null}
-            <div className="tools-heading">
-              <div>
-                <h2>可用工具</h2>
-                <p>展开可修改工具和返回结果</p>
               </div>
-              <button
-                className="subtle-button"
-                type="button"
-                onClick={() => {
-                  setTools((current) => [
-                    ...current,
-                    {
-                      id: crypto.randomUUID(),
-                      name: `tool_${current.length + 1}`,
-                      description: "说明何时使用这个工具",
-                      resultText: "{}",
-                    },
-                  ]);
-                  setExample("custom");
-                  setRuns(emptyRuns());
-                }}
-                disabled={running || tools.length >= 8}
-              >
-                + 添加
-              </button>
-            </div>
-            <div className="tool-list">
-              {tools.map((tool, index) => (
-                <details className="tool-editor" key={tool.id}>
-                  <summary>
-                    <strong>{tool.name || `工具 ${index + 1}`}</strong>
-                  </summary>
-                  <div className="tool-editor-heading">
-                    <span>名称、说明和模拟结果</span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setTools((current) => current.filter((item) => item.id !== tool.id));
-                        setExample("custom");
-                        setRuns(emptyRuns());
-                      }}
-                      disabled={running || tools.length === 1}
-                      aria-label={`移除工具 ${tool.name || index + 1}`}
-                    >
-                      移除
-                    </button>
-                  </div>
-                  <label className="field">
-                    <span>名称</span>
-                    <input
-                      value={tool.name}
-                      onChange={(event) => updateTool(tool.id, "name", event.target.value)}
-                      disabled={running}
-                      spellCheck={false}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>说明</span>
-                    <input
-                      value={tool.description}
-                      onChange={(event) => updateTool(tool.id, "description", event.target.value)}
-                      disabled={running}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>模拟返回 JSON</span>
-                    <textarea
-                      className="tool-result-input"
-                      value={tool.resultText}
-                      onChange={(event) => updateTool(tool.id, "resultText", event.target.value)}
-                      disabled={running}
-                      rows={2}
-                      spellCheck={false}
-                    />
-                  </label>
-                </details>
-              ))}
+              {inputError ? (
+                <p className="input-error" role="alert">
+                  {inputError}
+                </p>
+              ) : null}
+              <div className="tools-heading">
+                <div>
+                  <h2>可用工具</h2>
+                  <p>展开可修改工具和返回结果</p>
+                </div>
+                <button
+                  className="subtle-button"
+                  type="button"
+                  onClick={() => {
+                    setTools((current) => [
+                      ...current,
+                      {
+                        id: crypto.randomUUID(),
+                        name: `tool_${current.length + 1}`,
+                        description: "说明何时使用这个工具",
+                        resultText: "{}",
+                      },
+                    ]);
+                    setExample("custom");
+                    setRuns(emptyRuns());
+                  }}
+                  disabled={running || tools.length >= 8}
+                >
+                  + 添加
+                </button>
+              </div>
+              <div className="tool-list">
+                {tools.map((tool, index) => (
+                  <details className="tool-editor" key={tool.id}>
+                    <summary>
+                      <strong>{tool.name || `工具 ${index + 1}`}</strong>
+                    </summary>
+                    <div className="tool-editor-heading">
+                      <span>名称、说明和模拟结果</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTools((current) => current.filter((item) => item.id !== tool.id));
+                          setExample("custom");
+                          setRuns(emptyRuns());
+                        }}
+                        disabled={running || tools.length === 1}
+                        aria-label={`移除工具 ${tool.name || index + 1}`}
+                      >
+                        移除
+                      </button>
+                    </div>
+                    <label className="field">
+                      <span>名称</span>
+                      <input
+                        value={tool.name}
+                        onChange={(event) => updateTool(tool.id, "name", event.target.value)}
+                        disabled={running}
+                        spellCheck={false}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>说明</span>
+                      <input
+                        value={tool.description}
+                        onChange={(event) => updateTool(tool.id, "description", event.target.value)}
+                        disabled={running}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>模拟返回 JSON</span>
+                      <textarea
+                        className="tool-result-input"
+                        value={tool.resultText}
+                        onChange={(event) => updateTool(tool.id, "resultText", event.target.value)}
+                        disabled={running}
+                        rows={2}
+                        spellCheck={false}
+                      />
+                    </label>
+                  </details>
+                ))}
+              </div>
             </div>
           </aside>
 
           <section className="trace">
-            <ArchitectureDiagram architecture={architecture} />
+            <ArchitectureDiagram
+              architecture={architecture}
+              name={architectureNames[architecture]}
+            />
             {hasRuns ? (
               <div className="comparison">
                 <div className="comparison-heading">
@@ -742,7 +727,12 @@ export default function Home() {
                 {events.map((event, index) => {
                   if (event.type === "plan")
                     return (
-                      <article className="plan-event" key={index}>
+                      <article
+                        className="plan-event"
+                        key={index}
+                        id={`trace-${architecture}-${index}`}
+                        tabIndex={-1}
+                      >
                         <div className="event-heading">
                           <span className="plan-chip">计划</span>
                           <h3>{event.source === "fixed" ? "按规则确定顺序" : "模型制定步骤"}</h3>
@@ -759,6 +749,12 @@ export default function Home() {
                             </strong>
                           </div>
                         </div>
+                        <TraceFields
+                          events={events}
+                          index={index}
+                          links={traceLinks}
+                          onInspect={inspectField}
+                        />
                         <RawDetails>
                           {event.source === "model" ? (
                             <div className="io-grid">
@@ -775,12 +771,18 @@ export default function Home() {
                     const { query, previousTools, availableTools, calledTools } =
                       modelSummary(event);
                     return (
-                      <article className="model-event" key={index}>
+                      <article
+                        className="model-event"
+                        key={index}
+                        id={`trace-${architecture}-${index}`}
+                        tabIndex={-1}
+                      >
                         <div className="event-heading">
                           <span className="round-chip">
                             {event.purpose === "summary" ? "总结" : `第 ${event.round} 轮`}
                           </span>
                           <h3>{event.purpose === "summary" ? "模型总结" : "问模型"}</h3>
+                          <small>HTTP {event.status}</small>
                         </div>
                         <div className="step-summary">
                           <div>
@@ -816,6 +818,17 @@ export default function Home() {
                             </strong>
                           </div>
                         </div>
+                        {calledTools.length > 1 ? (
+                          <p className="batch-call-note">
+                            本轮返回 {calledTools.length} 个调用，不符合当前每轮一个工具的规则。
+                          </p>
+                        ) : null}
+                        <TraceFields
+                          events={events}
+                          index={index}
+                          links={traceLinks}
+                          onInspect={inspectField}
+                        />
                         <RawDetails>
                           <div className="io-grid">
                             <JsonPanel title="发给模型 · 完整请求" value={event.request} />
@@ -827,24 +840,22 @@ export default function Home() {
                   }
                   if (event.type === "tool")
                     return (
-                      <article className="tool-event" key={index}>
+                      <article
+                        className="tool-event"
+                        key={index}
+                        id={`trace-${architecture}-${index}`}
+                        tabIndex={-1}
+                      >
                         <div className="event-heading">
                           <span className="tool-chip">工具</span>
                           <h3>{event.name}</h3>
                         </div>
-                        <div className="step-summary">
-                          <div>
-                            <span className="step-label">传入参数</span>
-                            <code>{compact(event.arguments)}</code>
-                          </div>
-                          <div>
-                            <span className="step-label">返回结果</span>
-                            <code>
-                              {compact(asRecord(event.observation)?.result ?? event.observation)}
-                            </code>
-                          </div>
-                        </div>
-                        <p className="next-step">结果已记录 → {event.next ?? "再问模型"}</p>
+                        <TraceFields
+                          events={events}
+                          index={index}
+                          links={traceLinks}
+                          onInspect={inspectField}
+                        />
                         <RawDetails>
                           <div className="tool-grid">
                             <JsonPanel title="工具收到的参数" value={event.arguments} />
@@ -856,7 +867,12 @@ export default function Home() {
                     );
                   if (event.type === "final")
                     return (
-                      <article className="final-event" key={index}>
+                      <article
+                        className="final-event"
+                        key={index}
+                        id={`trace-${architecture}-${index}`}
+                        tabIndex={-1}
+                      >
                         <span>结束 · {event.reason}</span>
                         <h3>最终回答</h3>
                         <p>{event.answer || "模型未返回文字回答"}</p>
@@ -876,6 +892,13 @@ export default function Home() {
           </section>
         </div>
       </div>
+      <TraceInspector
+        selection={inspection?.selection ?? null}
+        events={inspectionEvents}
+        links={inspectionLinks}
+        onClose={() => setInspection(null)}
+        onLocate={locateTrace}
+      />
     </main>
   );
 }

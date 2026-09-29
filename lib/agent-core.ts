@@ -87,6 +87,47 @@ export function parseToolArguments(raw: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+export function validateReactToolCall(
+  calls: unknown,
+  tools: DemoTool[],
+  used: ReadonlySet<string>,
+  usedCallIds: ReadonlySet<string>,
+): { call: ToolCall; tool: DemoTool; arguments: Record<string, unknown> } | null {
+  if (calls === undefined || calls === null) return null;
+  if (!Array.isArray(calls)) throw new Error("模型返回的 tool_calls 必须是数组");
+  if (calls.length === 0) return null;
+  if (calls.length > 1) {
+    throw new Error("ReAct 每轮只能调用一个工具：模型返回了多个调用，本轮未执行任何工具");
+  }
+  const call = calls[0];
+  if (!call || typeof call !== "object" || Array.isArray(call)) {
+    throw new Error("模型返回的工具调用格式无效");
+  }
+  if (call.type !== "function") throw new Error("工具调用类型必须是 function");
+  if (typeof call.id !== "string" || !call.id.trim()) {
+    throw new Error("工具调用缺少有效的调用 ID");
+  }
+  if (usedCallIds.has(call.id)) throw new Error(`调用 ID ${call.id} 已使用，禁止重复调用`);
+  if (
+    !call.function ||
+    typeof call.function !== "object" ||
+    Array.isArray(call.function) ||
+    typeof call.function.name !== "string" ||
+    !call.function.name.trim()
+  ) {
+    throw new Error("工具调用缺少有效的工具名称");
+  }
+  const tool = tools.find((item) => item.name === call.function.name);
+  if (!tool) throw new Error(`模型请求了未知工具 ${call.function.name}`);
+  if (used.has(tool.name)) throw new Error(`工具 ${tool.name} 已调用，禁止重复调用`);
+  if (typeof call.function.arguments !== "string") {
+    throw new Error("工具参数 arguments 必须是 JSON 字符串");
+  }
+  const args = parseToolArguments(call.function.arguments);
+  if (typeof args.input !== "string") throw new Error("工具参数 input 必须存在且为字符串");
+  return { call: call as ToolCall, tool, arguments: args };
+}
+
 export function createFixedPlan(query: string, tools: DemoTool[]): PlanStep[] {
   const mentioned = tools.filter((tool) =>
     new RegExp(`(^|[^a-zA-Z0-9_])${tool.name}(?=$|[^a-zA-Z0-9_])`).test(query),

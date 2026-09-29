@@ -5,14 +5,19 @@ import {
   createModelRequest,
   parseModelPlan,
   parseRunInput,
-  parseToolArguments,
+  validateReactToolCall,
   type ChatMessage,
   type PlanStep,
   type ToolCall,
 } from "@/lib/agent-core";
 
 const reactPrompt =
-  "你是一个最小化的工具调用 Agent。每轮根据用户请求和已有工具结果，决定调用哪个尚未使用的工具，或直接给出结论。每次响应尽量只调用一个工具。若用户要求根据前一个工具的结果决定是否调用后续工具，必须先观察前一个结果；不要仅因为任务提到工具名就提前调用它。已调用工具会从当前 tools 列表移除；messages 中已有的 assistant tool_calls 和对应 tool 消息代表真实的历史调用及结果，即使当前 tools 不再列出，也必须将它们视为已完成的调用，不要否认。不要编造工具结果。最终用中文简短回答。";
+  "你是一个严格逐步执行的 ReAct Agent。每轮读取用户问题和完整历史，根据已有工具结果决定下一步。" +
+  "硬性规则：每次响应的 tool_calls 最多只能包含一个调用。即使用户同时提到 a、b，也只能先调用其中一个，必须等待它的真实 Observation 返回后，再决定是否调用另一个。禁止一次响应给出多个调用。" +
+  "每个工具在本次任务中最多调用一次。禁止再次调用 messages 中已经出现过的工具；每次新调用使用唯一的 id。已调用工具会从当前 tools 列表移除。" +
+  "若用户指定了先后顺序，先执行排在前面的工具；若后续调用取决于前一个结果，必须先检查该结果，不满足条件就不调用。" +
+  "arguments 必须是 JSON 对象，input 必须是字符串。messages 中的 assistant tool_calls 和对应 tool 消息是真实历史，必须承认已完成的调用，不要编造结果。" +
+  "已有结果足够或没有可用工具时，直接用中文简短回答，不再返回 tool_calls。";
 const summaryPrompt =
   "你负责总结一个工具执行流程。后续消息是执行器真实记录的工具参数和返回结果。只依据用户问题与这些结果，用中文简短回答；不要否认已经完成的调用，不要编造结果。";
 const encoder = new TextEncoder();
@@ -82,6 +87,7 @@ export async function POST(request: Request) {
           { role: "user", content: input.query },
         ];
         const used = new Set<string>();
+        const usedCallIds = new Set<string>();
         for (let round = 1; round <= input.tools.length + 1; round++) {
           const available = input.tools.filter((tool) => !used.has(tool.name));
           const requestBody = createModelRequest(messages, available);
@@ -95,8 +101,13 @@ export async function POST(request: Request) {
             status: result.status,
           });
           const assistant = assistantFrom(result);
-          const calls = assistant.tool_calls ?? [];
-          if (!calls.length) {
+          const selected = validateReactToolCall(
+            assistant.tool_calls,
+            input.tools,
+            used,
+            usedCallIds,
+          );
+          if (!selected) {
             emit({
               type: "final",
               answer: assistant.content ?? "",
@@ -105,40 +116,28 @@ export async function POST(request: Request) {
             return;
           }
 
-          const selected = new Set<string>();
-          const results = calls.map((call) => {
-            const tool = available.find((item) => item.name === call.function?.name);
-            if (!tool || selected.has(tool.name)) throw new Error("模型返回了未知或重复的工具调用");
-            selected.add(tool.name);
-            const args = parseToolArguments(call.function.arguments);
-            return {
-              call,
-              name: tool.name,
-              arguments: args,
-              observation: { received_arguments: args, result: tool.result },
-            };
-          });
+          const { call, tool, arguments: args } = selected;
+          const observation = { received_arguments: args, result: tool.result };
           messages = appendToolResults(
             messages,
             { role: "assistant", content: assistant.content ?? null },
-            results,
+            [{ call, observation }],
           );
-          for (const item of results) {
-            used.add(item.name);
-            emit({
-              type: "tool",
-              round,
-              name: item.name,
-              arguments: item.arguments,
-              observation: item.observation,
-              next: "再问模型",
-              appended_message: {
-                role: "tool",
-                tool_call_id: item.call.id,
-                content: JSON.stringify(item.observation),
-              },
-            });
-          }
+          used.add(tool.name);
+          usedCallIds.add(call.id);
+          emit({
+            type: "tool",
+            round,
+            name: tool.name,
+            arguments: args,
+            observation,
+            next: "观察结果，再决定下一步",
+            appended_message: {
+              role: "tool",
+              tool_call_id: call.id,
+              content: JSON.stringify(observation),
+            },
+          });
         }
         throw new Error("达到最大轮数，循环已停止");
       }
