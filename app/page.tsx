@@ -1,682 +1,880 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  ArrowRight,
-  Braces,
-  Check,
-  ChevronDown,
-  CircleStop,
-  Copy,
-  FlaskConical,
-  Play,
-  RotateCcw,
-  Sparkles,
-  StepForward,
-  Wrench,
-  Zap,
-} from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
+import { useRef, useState, type ReactNode } from "react";
+import { Brain, Minimize2, PanelLeftClose, PanelLeftOpen, Workflow } from "lucide-react";
 
-type RunMode = "auto" | "manual";
-type ManualAction = "prepare" | "decide" | "execute";
-type ExperimentVariant = "control" | "ambiguous" | "budget_first";
-type ToolName = "search_solutions" | "analyze_reviews" | "compare_pricing";
-type ToolProposal = { callId: string; name: ToolName; arguments: Record<string, unknown> };
-type ToolHistory = ToolProposal & { result: unknown };
-type FinalResult = {
-  summary: string;
-  recommendation: string;
-  evidence: string[];
-  risks: string[];
-  next_steps: string[];
+type ToolDraft = { id: string; name: string; description: string; resultText: string };
+type ModelEvent = {
+  type: "model";
+  round: number;
+  purpose?: "decision" | "summary";
+  used_tools?: string[];
+  request: unknown;
+  response: unknown;
+  status: number;
 };
-type ProtocolTrace = {
+type ToolEvent = {
+  type: "tool";
+  round: number;
+  name: string;
+  arguments: unknown;
+  observation: unknown;
+  appended_message: unknown;
+  next?: string;
+};
+type PlanEvent = {
+  type: "plan";
+  source: "fixed" | "model";
+  steps: Array<{ name: string; input: string }>;
   request?: unknown;
   response?: unknown;
-  parsed?: unknown;
-  messageAppend?: unknown;
-  note?: string;
+  status?: number;
 };
-type ToolSelection = {
-  selected: { name: string; description?: string };
-  not_selected_this_round: Array<{ name: string; description: string }>;
-  tool_order: string[];
-  model_summary: string;
-};
-type AgentEvent = {
-  id: string;
-  type: "status" | "tool_call" | "tool_result" | "final" | "error";
-  title: string;
-  detail?: string;
-  tool?: string;
-  input?: unknown;
-  output?: unknown;
-  protocol?: ProtocolTrace;
-  selection?: ToolSelection;
-  decision?: { reason?: string };
+type FinalEvent = { type: "final"; answer: string; reason: string };
+type ErrorEvent = { type: "error"; message: string };
+type AgentEvent = ModelEvent | ToolEvent | PlanEvent | FinalEvent | ErrorEvent;
+type Architecture = "react" | "fixed" | "plan";
+type Example = "basic" | "conditional" | "custom";
+type RunRecord = {
+  events: AgentEvent[];
+  status: "running" | "complete" | "error" | "stopped";
+  durationMs: number | null;
 };
 
-const examples = [
-  "帮我为 10 人产品团队选择 AI 知识库方案，预算每月 1500 元",
-  "10 人产品团队预算降到每月 800 元，优先考虑上手快和低维护",
-  "比较 Notion AI、Guru 和 Slite，给出适合 10 人初创团队的建议",
-  "团队主要使用 Slack 和 Jira，哪种 AI 知识库集成体验更合适",
-  "我们有复杂的文档权限，预算每月 1500 元，应该选哪个方案",
-  "需要从旧文档库迁移 500 篇资料，请评估方案和迁移风险",
-  "按 10 个席位计算半年总成本，并给出性价比最高的选择",
-  "重点分析候选方案的差评和潜在风险，再给出保守建议",
+const architectures: Architecture[] = ["react", "fixed", "plan"];
+const architectureNames: Record<Architecture, string> = {
+  react: "ReAct 循环",
+  fixed: "固定流程",
+  plan: "先计划后执行",
+};
+const emptyRuns = (): Record<Architecture, RunRecord | null> => ({
+  react: null,
+  fixed: null,
+  plan: null,
+});
+const basicQuery = "我需要调用 a、b，然后总结结果。";
+const conditionalQuery =
+  "先调用 a；仅当 a 返回的 need_b 为 true 时，再调用 b。最后根据实际结果总结。";
+
+const architectureNotes: Record<Architecture, string> = {
+  react: "看一次结果，再决定下一步。",
+  fixed: "按工具列表顺序，执行任务中点名的工具。",
+  plan: "模型先列出步骤，再依次执行。",
+};
+
+const modules = [
+  { name: "工具调用", icon: Workflow, current: true },
+  { name: "上下文压缩", icon: Minimize2, current: false },
+  { name: "长期记忆", icon: Brain, current: false },
+] as const;
+
+const initialTools: ToolDraft[] = [
+  { id: "a", name: "a", description: "用户要求调用 a 时使用", resultText: '{"value":"A 的结果"}' },
+  { id: "b", name: "b", description: "用户要求调用 b 时使用", resultText: '{"value":"B 的结果"}' },
+  { id: "c", name: "c", description: "用户要求调用 c 时使用", resultText: '{"value":"C 的结果"}' },
 ];
 
-const experimentOptions: Array<{
-  value: ExperimentVariant;
-  title: string;
-  description: string;
-}> = [
-  { value: "control", title: "清晰职责", description: "候选、评价、价格各有分工" },
-  { value: "ambiguous", title: "模糊描述", description: "三个工具的描述相同" },
-  { value: "budget_first", title: "预算优先", description: "价格工具排在首位" },
-];
-
-function TraceMark({ size = 20 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true">
-      <path
-        d="M8 9h9a6 6 0 0 1 0 12H8"
-        stroke="currentColor"
-        strokeWidth="2.5"
-        strokeLinecap="round"
-      />
-      <circle cx="8" cy="9" r="3" fill="currentColor" />
-      <circle cx="23" cy="15" r="3" fill="currentColor" />
-      <circle cx="8" cy="21" r="3" fill="#7be4bd" />
-    </svg>
-  );
+function conditionalTools(needsB: boolean): ToolDraft[] {
+  return [
+    {
+      id: "a",
+      name: "a",
+      description: "先检查是否需要调用 b，返回 need_b",
+      resultText: JSON.stringify({ need_b: needsB, value: needsB ? "需要 b" : "无需 b" }),
+    },
+    {
+      id: "b",
+      name: "b",
+      description: "仅当 a 的 need_b 为 true 时使用",
+      resultText: '{"value":"B 的结果"}',
+    },
+    { ...initialTools[2] },
+  ];
 }
 
-function JsonBlock({ label, value }: { label: string; value: unknown }) {
+function modelCalls(events: AgentEvent[]) {
+  return events.filter(
+    (event) => event.type === "model" || (event.type === "plan" && event.source === "model"),
+  ).length;
+}
+
+function calledTools(events: AgentEvent[]) {
+  return events
+    .filter((event): event is ToolEvent => event.type === "tool")
+    .map((event) => event.name);
+}
+
+function formatDuration(ms: number | null) {
+  if (ms === null) return "—";
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
+function JsonPanel({ title, value }: { title: string; value: unknown }) {
   return (
-    <div className="event-payload">
-      <span>{label}</span>
-      <pre className="json-view">{JSON.stringify(value, null, 2) ?? String(value)}</pre>
+    <div className="json-panel">
+      <div className="json-panel-title">{title}</div>
+      <pre>{JSON.stringify(value, null, 2) ?? String(value)}</pre>
     </div>
   );
 }
 
-function EventCard({ event, index }: { event: AgentEvent; index: number }) {
-  const eventLabel = {
-    status: "模型步骤",
-    tool_call: "工具调用",
-    tool_result: "观察结果",
-    final: "最终输出",
-    error: "运行错误",
-  }[event.type];
-  const Icon =
-    event.type === "tool_call"
-      ? Wrench
-      : event.type === "final"
-        ? Sparkles
-        : event.type === "error"
-          ? CircleStop
-          : event.type === "tool_result"
-            ? Check
-            : Braces;
-  const protocol = event.protocol;
-  const hasProtocol =
-    protocol &&
-    (protocol.request !== undefined ||
-      protocol.response !== undefined ||
-      protocol.parsed !== undefined ||
-      protocol.messageAppend !== undefined);
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
 
+function compact(value: unknown): string {
+  const record = asRecord(value);
+  if (record && Object.keys(record).length === 1) {
+    if (typeof record.input === "string") return record.input;
+    if (typeof record.value === "string") return record.value;
+  }
+  if (typeof value === "string") return value;
+  return JSON.stringify(value) ?? String(value);
+}
+
+function modelSummary(event: ModelEvent) {
+  const request = asRecord(event.request);
+  const messages = Array.isArray(request?.messages) ? request.messages : [];
+  const userMessage = messages.find((message) => asRecord(message)?.role === "user");
+  const query = asRecord(userMessage)?.content;
+  const previousTools = messages
+    .filter((message) => asRecord(message)?.role === "assistant")
+    .flatMap((message) => {
+      const calls = asRecord(message)?.tool_calls;
+      return Array.isArray(calls)
+        ? calls
+            .map((call) => asRecord(asRecord(call)?.function)?.name)
+            .filter((name): name is string => typeof name === "string")
+        : [];
+    });
+  const availableTools = Array.isArray(request?.tools)
+    ? request.tools
+        .map((tool) => asRecord(asRecord(tool)?.function)?.name)
+        .filter((name): name is string => typeof name === "string")
+    : [];
+  const response = asRecord(event.response);
+  const choices = Array.isArray(response?.choices) ? response.choices : [];
+  const message = asRecord(asRecord(choices[0])?.message);
+  const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+  const calledTools = calls
+    .map((call) => asRecord(asRecord(call)?.function)?.name)
+    .filter((name): name is string => typeof name === "string");
+  return {
+    query,
+    previousTools: event.used_tools ?? previousTools,
+    availableTools,
+    calledTools,
+  };
+}
+
+function RawDetails({ children }: { children: ReactNode }) {
   return (
-    <article className={`trace-event trace-event--${event.type}`}>
-      <span className="event-marker" aria-hidden="true">
-        <Icon size={17} />
-      </span>
-      <div className="event-content">
-        <div className="event-header">
-          <span className="event-type">
-            {String(index + 1).padStart(2, "0")} · {eventLabel}
-          </span>
-          {event.tool ? <code>{event.tool}</code> : null}
-        </div>
-        <h3>{event.title}</h3>
-        {event.detail ? <p className="event-detail">{event.detail}</p> : null}
-        {event.title === "DeepSeek 决定停止调用工具" && event.decision?.reason ? (
-          <p className="event-detail">模型说明：{event.decision.reason}</p>
-        ) : null}
-        {event.selection ? (
-          <div className="selection-analysis">
-            <strong>本轮选择：{event.selection.selected.name}</strong>
-            {event.selection.selected.description ? (
-              <p>{event.selection.selected.description}</p>
-            ) : null}
-            <p>{event.selection.model_summary}</p>
-            <small>可用顺序：{event.selection.tool_order.join(" → ")}</small>
-            {event.selection.not_selected_this_round.length ? (
-              <small>
-                本轮未选：
-                {event.selection.not_selected_this_round.map((item) => item.name).join("、")}
-              </small>
-            ) : null}
-          </div>
-        ) : null}
-        {event.input !== undefined ? <JsonBlock label="输入" value={event.input} /> : null}
-        {event.output !== undefined && event.type !== "final" ? (
-          <JsonBlock label="Observation" value={event.output} />
-        ) : null}
-        {hasProtocol ? (
-          <details className="event-details">
-            <summary>
-              查看请求与响应 <ChevronDown size={15} />
-            </summary>
-            <div>
-              {protocol.request !== undefined ? (
-                <JsonBlock
-                  label={event.type === "tool_result" ? "Tool Request" : "Model Request"}
-                  value={protocol.request}
-                />
-              ) : null}
-              {protocol.response !== undefined ? (
-                <JsonBlock
-                  label={event.type === "tool_result" ? "Tool Response" : "Model Response"}
-                  value={protocol.response}
-                />
-              ) : null}
-              {protocol.parsed !== undefined ? (
-                <JsonBlock label="解析结果" value={protocol.parsed} />
-              ) : null}
-              {protocol.messageAppend !== undefined ? (
-                <JsonBlock label="写入下一轮上下文" value={protocol.messageAppend} />
-              ) : null}
-              {protocol.note ? <p className="helper-text">{protocol.note}</p> : null}
-            </div>
-          </details>
-        ) : null}
-      </div>
-    </article>
+    <details className="raw-details">
+      <summary>查看完整 JSON</summary>
+      {children}
+    </details>
   );
 }
 
-function ResultPanel({
-  result,
-  onCopy,
-  copied,
+function DiagramNode({
+  children,
+  tone = "neutral",
 }: {
-  result: FinalResult;
-  onCopy: () => void;
-  copied: boolean;
+  children: ReactNode;
+  tone?: "neutral" | "model" | "plan" | "tool" | "answer";
 }) {
+  return <span className={`diagram-node diagram-node-${tone}`}>{children}</span>;
+}
+
+function DiagramArrow() {
   return (
-    <section className="result-panel" aria-label="最终结论">
-      <div className="panel-heading">
-        <div>
-          <span className="eyebrow">最终结果</span>
-          <h2>结论与证据</h2>
-        </div>
-        <Button variant="outline" size="sm" onClick={onCopy}>
-          {copied ? <Check size={15} /> : <Copy size={15} />} {copied ? "已复制" : "复制 JSON"}
-        </Button>
+    <span className="diagram-arrow" aria-hidden="true">
+      →
+    </span>
+  );
+}
+
+function ArchitectureDiagram({ architecture }: { architecture: Architecture }) {
+  return (
+    <section className="architecture-diagram" aria-labelledby="architecture-diagram-title">
+      <div className="architecture-diagram-heading">
+        <h2 id="architecture-diagram-title">架构图</h2>
+        <span>{architectureNames[architecture]}</span>
       </div>
-      <div className="result-lead">
-        <span>建议</span>
-        <p>{result.recommendation}</p>
-      </div>
-      <p className="result-summary">{result.summary}</p>
-      <div className="result-grid">
-        <div className="result-section">
-          <h3>证据</h3>
-          <ul>
-            {result.evidence.map((item, index) => (
-              <li key={`${index}-${item}`}>{item}</li>
-            ))}
-          </ul>
+      {architecture === "react" ? (
+        <div className="diagram-canvas">
+          <div className="diagram-line">
+            <DiagramNode>用户问题</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="model">模型决策</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="answer">无需工具则回答</DiagramNode>
+          </div>
+          <div className="diagram-loop">
+            <span className="diagram-branch-label">需要工具时 ↓</span>
+            <div className="diagram-line diagram-loop-line">
+              <DiagramNode tone="tool">调用工具</DiagramNode>
+              <DiagramArrow />
+              <DiagramNode>观察结果</DiagramNode>
+              <span className="diagram-return">↶ 带结果回到模型决策</span>
+            </div>
+          </div>
+          <p className="diagram-caption">无需工具时直接回答；需要工具时进入下一轮。</p>
         </div>
-        <div className="result-section">
-          <h3>风险与后续</h3>
-          <ul>
-            {result.risks.map((item, index) => (
-              <li key={`risk-${index}-${item}`}>{item}</li>
-            ))}
-          </ul>
-          <h3>下一步</h3>
-          <ul>
-            {result.next_steps.map((item, index) => (
-              <li key={`next-${index}-${item}`}>{item}</li>
-            ))}
-          </ul>
+      ) : architecture === "fixed" ? (
+        <div className="diagram-canvas">
+          <div className="diagram-line">
+            <DiagramNode>用户问题</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="plan">规则选工具</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="tool">依次执行</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="model">模型总结</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="answer">最终结论</DiagramNode>
+          </div>
+          <p className="diagram-caption">工具顺序在执行前确定。</p>
         </div>
-      </div>
-      <details className="event-details">
-        <summary>
-          查看原始 JSON <ChevronDown size={15} />
-        </summary>
-        <JsonBlock label="Final JSON" value={result} />
-      </details>
+      ) : (
+        <div className="diagram-canvas">
+          <div className="diagram-line">
+            <DiagramNode>用户问题</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="model">模型规划</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="plan">计划清单</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="tool">依次执行</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="model">模型总结</DiagramNode>
+            <DiagramArrow />
+            <DiagramNode tone="answer">最终结论</DiagramNode>
+          </div>
+          <p className="diagram-caption">模型先定计划，执行中不重新规划。</p>
+        </div>
+      )}
     </section>
   );
 }
 
 export default function Home() {
-  const [question, setQuestion] = useState(examples[0]);
-  const [mode, setMode] = useState<RunMode>("auto");
-  const [experimentVariant, setExperimentVariant] = useState<ExperimentVariant>("control");
-  const [events, setEvents] = useState<AgentEvent[]>([]);
-  const [result, setResult] = useState<FinalResult | null>(null);
+  const [query, setQuery] = useState(basicQuery);
+  const [architecture, setArchitecture] = useState<Architecture>("react");
+  const [tools, setTools] = useState<ToolDraft[]>(initialTools);
+  const [example, setExample] = useState<Example>("basic");
+  const [needsB, setNeedsB] = useState(false);
+  const [runs, setRuns] = useState<Record<Architecture, RunRecord | null>>(emptyRuns);
   const [running, setRunning] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [copied, setCopied] = useState(false);
-  const [manualAction, setManualAction] = useState<ManualAction | null>(null);
-  const [manualHistory, setManualHistory] = useState<ToolHistory[]>([]);
-  const [manualProposal, setManualProposal] = useState<ToolProposal | null>(null);
+  const [runningMode, setRunningMode] = useState<Architecture | null>(null);
+  const [inputError, setInputError] = useState("");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const runIdRef = useRef(0);
-  const traceRef = useRef<HTMLDivElement>(null);
-  const manualSession = mode === "manual" && manualAction !== null && !result;
-  const toolCount = useMemo(
-    () => events.filter((event) => event.type === "tool_call").length,
-    [events],
-  );
-  const progress =
-    running || manualSession ? Math.min(92, 8 + events.length * 8) : result ? 100 : 0;
 
-  useEffect(() => {
-    if (!running) return;
-    const start = Date.now() - elapsed * 1000;
-    const timer = window.setInterval(() => setElapsed((Date.now() - start) / 1000), 100);
-    return () => window.clearInterval(timer);
-  }, [running]);
+  function updateTool(id: string, field: "name" | "description" | "resultText", value: string) {
+    setTools((current) =>
+      current.map((tool) => (tool.id === id ? { ...tool, [field]: value } : tool)),
+    );
+    setExample("custom");
+    setRuns(emptyRuns());
+  }
 
-  useEffect(() => {
-    if (running || manualSession)
-      traceRef.current?.scrollTo({ top: traceRef.current.scrollHeight, behavior: "smooth" });
-  }, [events, running, manualSession]);
+  function loadExample(next: "basic" | "conditional") {
+    setExample(next);
+    setNeedsB(false);
+    setQuery(next === "basic" ? basicQuery : conditionalQuery);
+    setTools(
+      next === "basic" ? initialTools.map((tool) => ({ ...tool })) : conditionalTools(false),
+    );
+    setRuns(emptyRuns());
+    setInputError("");
+  }
 
-  function resetRun() {
+  function changeCondition(value: boolean) {
+    setNeedsB(value);
+    setTools((current) =>
+      current.map((tool) =>
+        tool.id === "a"
+          ? {
+              ...tool,
+              resultText: JSON.stringify({ need_b: value, value: value ? "需要 b" : "无需 b" }),
+            }
+          : tool,
+      ),
+    );
+    setRuns(emptyRuns());
+  }
+
+  function resetTrace() {
     runIdRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
     setRunning(false);
-    setEvents([]);
-    setResult(null);
-    setElapsed(0);
-    setManualAction(null);
-    setManualHistory([]);
-    setManualProposal(null);
+    setRunningMode(null);
+    setRuns(emptyRuns());
+    setInputError("");
   }
 
-  function appendError(error: unknown, runId: number) {
-    if (runId !== runIdRef.current) return;
-    if (error instanceof Error && error.name === "AbortError") return;
-    setEvents((current) => [
-      ...current,
-      {
-        id: crypto.randomUUID(),
-        type: "error",
-        title: "运行中断",
-        detail: error instanceof Error ? error.message : "未知错误",
-      },
-    ]);
-  }
-
-  async function runAuto() {
-    if (!question.trim() || running) return;
-    resetRun();
+  async function runModes(modes: Architecture[]) {
+    if (running) return;
+    setInputError("");
+    let configuredTools: Array<{ name: string; description: string; result: unknown }>;
+    try {
+      configuredTools = tools.map((tool) => ({
+        name: tool.name.trim(),
+        description: tool.description.trim(),
+        result: JSON.parse(tool.resultText),
+      }));
+    } catch {
+      setInputError("工具返回值必须是有效 JSON");
+      return;
+    }
+    if (!query.trim()) {
+      setInputError("请输入任务");
+      return;
+    }
+    if (new Set(configuredTools.map((tool) => tool.name)).size !== configuredTools.length) {
+      setInputError("工具名称不能重复");
+      return;
+    }
+    runIdRef.current += 1;
     const runId = runIdRef.current;
     const controller = new AbortController();
     abortRef.current = controller;
     setRunning(true);
+    if (modes.length > 1) setRuns(emptyRuns());
     try {
-      const response = await fetch("/api/agent", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: question.trim(),
-          includeTaskSpec: false,
-          experimentVariant,
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok || !response.body) throw new Error("Agent 服务暂时不可用");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (runId !== runIdRef.current) return;
-          if (!line.trim()) continue;
-          const event = JSON.parse(line) as AgentEvent;
-          setEvents((current) => [...current, event]);
-          if (event.type === "final") setResult(event.output as FinalResult);
-        }
-      }
-    } catch (error) {
-      appendError(error, runId);
-    } finally {
-      if (runId === runIdRef.current) {
-        setRunning(false);
-        abortRef.current = null;
-      }
-    }
-  }
-
-  async function runManual(action: ManualAction = manualAction ?? "prepare") {
-    if (!question.trim() || running) return;
-    if (!manualSession) resetRun();
-    const runId = runIdRef.current;
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setRunning(true);
-    try {
-      const response = await fetch("/api/agent/step", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: question.trim(),
-          action,
-          history: manualHistory,
-          proposal: manualProposal,
-          experimentVariant,
-        }),
-        signal: controller.signal,
-      });
-      const payload = (await response.json()) as {
-        event?: Omit<AgentEvent, "id">;
-        nextAction?: ManualAction | null;
-        history?: ToolHistory[];
-        proposal?: ToolProposal | null;
-        error?: string;
-      };
-      if (runId !== runIdRef.current) return;
-      if (!response.ok || !payload.event) throw new Error(payload.error || "当前步骤执行失败");
-      const event = { id: crypto.randomUUID(), ...payload.event } as AgentEvent;
-      setEvents((current) => [...current, event]);
-      if (event.type === "final") setResult(event.output as FinalResult);
-      setManualAction(payload.nextAction ?? null);
-      setManualHistory(payload.history ?? []);
-      setManualProposal(payload.proposal ?? null);
-    } catch (error) {
-      appendError(error, runId);
-    } finally {
-      if (runId === runIdRef.current) {
-        setRunning(false);
-        abortRef.current = null;
-      }
-    }
-  }
-
-  async function copyResult() {
-    if (!result) return;
-    await navigator.clipboard.writeText(JSON.stringify(result, null, 2));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  }
-
-  useEffect(() => {
-    const context = (
-      document as Document & {
-        modelContext?: {
-          registerTool?: (
-            tool: unknown,
-            options?: { signal?: AbortSignal },
-          ) => void | Promise<void>;
+      for (const mode of modes) {
+        if (controller.signal.aborted || runId !== runIdRef.current) break;
+        const started = performance.now();
+        const received: AgentEvent[] = [];
+        let status: RunRecord["status"] = "running";
+        setArchitecture(mode);
+        setRunningMode(mode);
+        setRuns((current) => ({
+          ...current,
+          [mode]: { events: [], status: "running", durationMs: null },
+        }));
+        const addEvent = (event: AgentEvent) => {
+          received.push(event);
+          if (event.type === "error") status = "error";
+          setRuns((current) => ({
+            ...current,
+            [mode]: { events: [...received], status: "running", durationMs: null },
+          }));
         };
+        try {
+          const response = await fetch("/api/agent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: query.trim(),
+              tools: configuredTools,
+              architecture: mode,
+            }),
+            signal: controller.signal,
+          });
+          if (!response.ok || !response.body) {
+            const payload = (await response.json()) as { error?: string };
+            throw new Error(payload.error || "Agent 服务不可用");
+          }
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+            for (const line of lines) {
+              if (runId !== runIdRef.current) return;
+              if (line.trim()) addEvent(JSON.parse(line) as AgentEvent);
+            }
+          }
+          if (buffer.trim() && runId === runIdRef.current) {
+            addEvent(JSON.parse(buffer) as AgentEvent);
+          }
+          if (status === "running") status = "complete";
+        } catch (error) {
+          status = controller.signal.aborted ? "stopped" : "error";
+          if (status === "error" && runId === runIdRef.current) {
+            addEvent({
+              type: "error",
+              message: error instanceof Error ? error.message : "运行失败",
+            });
+          }
+        } finally {
+          if (runId === runIdRef.current) {
+            setRuns((current) => ({
+              ...current,
+              [mode]: {
+                events: [...received],
+                status,
+                durationMs: performance.now() - started,
+              },
+            }));
+          }
+        }
+        if (controller.signal.aborted) break;
       }
-    ).modelContext;
-    if (!context?.registerTool) return;
-    const lifecycle = new AbortController();
-    void Promise.resolve(
-      context.registerTool(
-        {
-          name: "prepare_agent_demo",
-          title: "准备 Agent 演示",
-          description: "在页面中填写问题，准备可视化 Agent 工具调用循环。",
-          inputSchema: {
-            type: "object",
-            properties: { question: { type: "string", minLength: 3 } },
-            required: ["question"],
-            additionalProperties: false,
-          },
-          annotations: { readOnlyHint: false, untrustedContentHint: true },
-          execute: async (input: unknown) => {
-            const value = input as { question?: string };
-            if (!value.question?.trim()) throw new Error("question is required");
-            setQuestion(value.question.trim());
-            return { status: "ready", question: value.question.trim() };
-          },
-        },
-        { signal: lifecycle.signal },
-      ),
-    ).catch(() => undefined);
-    return () => lifecycle.abort();
-  }, []);
+    } finally {
+      if (runId === runIdRef.current) {
+        setRunning(false);
+        setRunningMode(null);
+        abortRef.current = null;
+      }
+    }
+  }
 
-  const manualButtonText =
-    manualAction === "execute"
-      ? "批准并执行工具"
-      : manualAction === "decide"
-        ? "发送给 DeepSeek"
-        : manualAction === "prepare"
-          ? "准备下一轮输入"
-          : "开始分步运行";
-  const runningText =
-    mode === "manual" && manualAction === "execute"
-      ? "正在执行演示工具…"
-      : mode === "manual" && (manualAction === null || manualAction === "prepare")
-        ? "正在准备模型输入…"
-        : "DeepSeek 正在决定下一步…";
+  const selectedRun = runs[architecture];
+  const events = selectedRun?.events ?? [];
+  const modelCount = modelCalls(events);
+  const toolCount = calledTools(events).length;
+  const hasRuns = architectures.some((mode) => runs[mode] !== null);
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">
-            <TraceMark />
-          </span>
-          <div>
-            <strong>Agent 调用可视化平台</strong>
-            <span>工具调用与 ReAct 轨迹</span>
-          </div>
+    <main className="app">
+      <header className="header">
+        <div className="brand-mark" aria-hidden="true">
+          ↻
         </div>
-        <div className="topbar-meta">
-          <span>deepseek-chat</span>
-          <span>工具结果为演示数据</span>
+        <div>
+          <strong>Agent 最小实验台</strong>
+          <span>观察不同架构的调用过程</span>
         </div>
-        <button className="reset-button" onClick={resetRun} aria-label="重置演示" title="重置演示">
-          <RotateCcw size={17} />
-        </button>
+        <span className="model-badge">deepseek-chat</span>
       </header>
 
-      <div className="workspace">
-        <aside className="setup-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">01 / SETUP</span>
-              <h1>设置任务</h1>
-            </div>
-          </div>
-          <div className="mode-picker">
-            <span className="field-label">运行方式</span>
-            <Tabs
-              value={mode}
-              onValueChange={(value) => {
-                setMode(value as RunMode);
-                resetRun();
-              }}
+      <div className={`workspace${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+        <nav className="module-sidebar" aria-label="功能导航">
+          <div className="module-sidebar-heading">
+            <span className="module-sidebar-label">功能模块</span>
+            <button
+              className="sidebar-toggle"
+              type="button"
+              aria-label={sidebarCollapsed ? "展开功能栏" : "收起功能栏"}
+              aria-expanded={!sidebarCollapsed}
+              title={sidebarCollapsed ? "展开功能栏" : "收起功能栏"}
+              onClick={() => setSidebarCollapsed((value) => !value)}
             >
-              <TabsList className="mode-tabs">
-                <TabsTrigger value="auto" disabled={running || manualSession}>
-                  <Zap size={15} /> 自动运行
-                </TabsTrigger>
-                <TabsTrigger value="manual" disabled={running || manualSession}>
-                  <StepForward size={15} /> 分步确认
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
+              {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+            </button>
           </div>
-          <div className="question-card">
-            <label className="field-label" htmlFor="question">
-              用户问题
-            </label>
-            <Textarea
-              id="question"
-              className="prompt-input"
-              value={question}
-              onChange={(event) => setQuestion(event.target.value)}
-              disabled={running || manualSession}
-              rows={5}
-            />
-          </div>
-          <Button
-            className={`run-button ${running ? "run-button--stop" : ""}`}
-            onClick={
-              running
-                ? () => abortRef.current?.abort()
-                : mode === "auto"
-                  ? runAuto
-                  : () => runManual()
-            }
-            disabled={!running && !question.trim()}
-          >
-            {running ? (
-              <>
-                <CircleStop size={17} /> 停止
-              </>
-            ) : mode === "manual" ? (
-              <>
-                <Play size={17} /> {manualButtonText}
-              </>
-            ) : (
-              <>
-                <Play size={17} /> 运行 ReAct 循环
-              </>
-            )}
-          </Button>
-          <p className="helper-text">工具选择和参数由模型生成；工具结果来自预设数据。</p>
-
-          <details className="experiment" open>
-            <summary>
-              <FlaskConical size={17} /> 工具选择实验 <ChevronDown size={16} />
-            </summary>
-            <p>切换描述与顺序，比较模型在相同问题下的选择。</p>
-            <RadioGroup
-              className="experiment-options"
-              value={experimentVariant}
-              onValueChange={(value) => {
-                setExperimentVariant(value as ExperimentVariant);
-                resetRun();
-              }}
-              disabled={running || manualSession}
-            >
-              {experimentOptions.map((option) => (
-                <label
-                  className={`experiment-option ${experimentVariant === option.value ? "is-selected" : ""}`}
-                  key={option.value}
-                >
-                  <RadioGroupItem value={option.value} />
-                  <span>
-                    <strong>{option.title}</strong>
-                    <small>{option.description}</small>
-                  </span>
-                </label>
-              ))}
-            </RadioGroup>
-          </details>
-          <details className="examples">
-            <summary>
-              试试这些问题 <span>{examples.length}</span>
-              <ChevronDown size={16} />
-            </summary>
-            <div className="examples-list">
-              {examples.map((example, index) => (
+          <div className="module-nav">
+            {modules.map((module) => {
+              const Icon = module.icon;
+              return (
                 <button
-                  key={example}
-                  onClick={() => setQuestion(example)}
-                  disabled={running || manualSession}
+                  className={`module-item${module.current ? " active" : " planned"}`}
+                  type="button"
+                  key={module.name}
+                  aria-current={module.current ? "page" : undefined}
+                  aria-label={module.current ? module.name : `${module.name}，规划中`}
+                  title={sidebarCollapsed ? module.name : undefined}
+                  disabled={!module.current}
+                  onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
                 >
-                  <span>{String(index + 1).padStart(2, "0")}</span>
-                  {example}
-                  <ArrowRight size={14} />
+                  <Icon size={18} strokeWidth={1.8} aria-hidden="true" />
+                  <span className="module-name">{module.name}</span>
+                  {!module.current ? <small>规划中</small> : null}
                 </button>
+              );
+            })}
+          </div>
+        </nav>
+        <div className="layout">
+          <aside className="setup">
+            <div className="section-title">
+              <h1>任务与工具</h1>
+            </div>
+            <div className="example-picker" aria-label="示例任务">
+              <span>示例</span>
+              <button
+                type="button"
+                className={example === "basic" ? "selected" : ""}
+                onClick={() => loadExample("basic")}
+                disabled={running}
+              >
+                基础
+              </button>
+              <button
+                type="button"
+                className={example === "conditional" ? "selected" : ""}
+                onClick={() => loadExample("conditional")}
+                disabled={running}
+              >
+                条件任务
+              </button>
+            </div>
+            <label className="field">
+              <span>任务</span>
+              <textarea
+                value={query}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  setExample("custom");
+                  setRuns(emptyRuns());
+                }}
+                disabled={running}
+                rows={4}
+              />
+            </label>
+            {example === "conditional" ? (
+              <label className="field condition-field">
+                <span>a 的返回结果</span>
+                <select
+                  value={needsB ? "true" : "false"}
+                  onChange={(event) => changeCondition(event.target.value === "true")}
+                  disabled={running}
+                >
+                  <option value="false">不需要调用 b</option>
+                  <option value="true">需要调用 b</option>
+                </select>
+                <small>ReAct 会看结果再决定；其他架构先定步骤。</small>
+              </label>
+            ) : null}
+            <label className="field architecture-field">
+              <span>架构</span>
+              <select
+                value={architecture}
+                onChange={(event) => setArchitecture(event.target.value as Architecture)}
+                disabled={running}
+              >
+                <option value="react">ReAct 循环</option>
+                <option value="fixed">固定流程</option>
+                <option value="plan">先计划后执行</option>
+              </select>
+              <small>{architectureNotes[architecture]}</small>
+            </label>
+            <div className="setup-actions">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => runModes([architecture])}
+                disabled={running}
+              >
+                {running
+                  ? `运行中：${architectureNames[runningMode ?? architecture]}`
+                  : "运行当前架构"}
+              </button>
+              <button
+                className="subtle-button compare-button"
+                type="button"
+                onClick={() => runModes(architectures)}
+                disabled={running}
+              >
+                对照三种架构
+              </button>
+              {running ? (
+                <button
+                  className="subtle-button"
+                  type="button"
+                  onClick={() => abortRef.current?.abort()}
+                >
+                  停止
+                </button>
+              ) : null}
+              <button className="subtle-button" type="button" onClick={resetTrace}>
+                清空结果
+              </button>
+            </div>
+            {inputError ? (
+              <p className="input-error" role="alert">
+                {inputError}
+              </p>
+            ) : null}
+            <div className="tools-heading">
+              <div>
+                <h2>可用工具</h2>
+                <p>展开可修改工具和返回结果</p>
+              </div>
+              <button
+                className="subtle-button"
+                type="button"
+                onClick={() => {
+                  setTools((current) => [
+                    ...current,
+                    {
+                      id: crypto.randomUUID(),
+                      name: `tool_${current.length + 1}`,
+                      description: "说明何时使用这个工具",
+                      resultText: "{}",
+                    },
+                  ]);
+                  setExample("custom");
+                  setRuns(emptyRuns());
+                }}
+                disabled={running || tools.length >= 8}
+              >
+                + 添加
+              </button>
+            </div>
+            <div className="tool-list">
+              {tools.map((tool, index) => (
+                <details className="tool-editor" key={tool.id}>
+                  <summary>
+                    <strong>{tool.name || `工具 ${index + 1}`}</strong>
+                  </summary>
+                  <div className="tool-editor-heading">
+                    <span>名称、说明和模拟结果</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTools((current) => current.filter((item) => item.id !== tool.id));
+                        setExample("custom");
+                        setRuns(emptyRuns());
+                      }}
+                      disabled={running || tools.length === 1}
+                      aria-label={`移除工具 ${tool.name || index + 1}`}
+                    >
+                      移除
+                    </button>
+                  </div>
+                  <label className="field">
+                    <span>名称</span>
+                    <input
+                      value={tool.name}
+                      onChange={(event) => updateTool(tool.id, "name", event.target.value)}
+                      disabled={running}
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>说明</span>
+                    <input
+                      value={tool.description}
+                      onChange={(event) => updateTool(tool.id, "description", event.target.value)}
+                      disabled={running}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>模拟返回 JSON</span>
+                    <textarea
+                      className="tool-result-input"
+                      value={tool.resultText}
+                      onChange={(event) => updateTool(tool.id, "resultText", event.target.value)}
+                      disabled={running}
+                      rows={2}
+                      spellCheck={false}
+                    />
+                  </label>
+                </details>
               ))}
             </div>
-          </details>
-        </aside>
+          </aside>
 
-        <section className="content-panel">
-          <div className="trace-header">
-            <div className="panel-heading">
-              <div>
-                <span className="eyebrow">02 / TRACE</span>
-                <h2>执行轨迹</h2>
-              </div>
-            </div>
-            <div className="run-stats">
-              <span>{toolCount} 次工具调用</span>
-              <span>{mode === "manual" ? `${events.length} 步` : `${elapsed.toFixed(1)} 秒`}</span>
-            </div>
-          </div>
-          <Progress className="trace-progress" value={progress} />
-          <div
-            className={`trace-list ${running && !events.length ? "trace-list--pending" : ""}`}
-            ref={traceRef}
-            aria-live="polite"
-          >
-            {events.length ? (
-              events.map((event, index) => <EventCard key={event.id} event={event} index={index} />)
-            ) : running ? (
-              <div className="pending-state">
-                <span className="pending-indicator" aria-hidden="true" />
-                <div>
-                  <strong>正在建立执行轨迹</strong>
-                  <p>{runningText}</p>
+          <section className="trace">
+            <ArchitectureDiagram architecture={architecture} />
+            {hasRuns ? (
+              <div className="comparison">
+                <div className="comparison-heading">
+                  <h2>架构对照</h2>
+                  <p>相同任务和工具，点选卡片查看各自的 trace。</p>
+                </div>
+                <div className="comparison-grid">
+                  {architectures.map((mode) => {
+                    const record = runs[mode];
+                    const order = record ? calledTools(record.events) : [];
+                    return (
+                      <button
+                        type="button"
+                        key={mode}
+                        className={`comparison-card${architecture === mode ? " selected" : ""}`}
+                        onClick={() => setArchitecture(mode)}
+                        disabled={!record}
+                        aria-pressed={architecture === mode}
+                      >
+                        <span className="comparison-card-top">
+                          <strong>{architectureNames[mode]}</strong>
+                          <small>
+                            {record?.status === "running"
+                              ? "运行中"
+                              : record?.status === "complete"
+                                ? "完成"
+                                : record?.status === "error"
+                                  ? "出错"
+                                  : record?.status === "stopped"
+                                    ? "已停止"
+                                    : "未运行"}
+                          </small>
+                        </span>
+                        <span className="comparison-metrics">
+                          模型 {record ? modelCalls(record.events) : "—"} 次 · 工具{" "}
+                          {record ? order.length : "—"} 次 ·{" "}
+                          {formatDuration(record?.durationMs ?? null)}
+                        </span>
+                        <span className="comparison-order">
+                          工具顺序：{record ? (order.length ? order.join(" → ") : "未调用") : "—"}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-            ) : (
+            ) : null}
+            <div className="trace-heading">
+              <div className="section-title">
+                <h2>{architectureNames[architecture]} · 运行过程</h2>
+              </div>
+              <div className="trace-stats">
+                <span>{modelCount} 次模型请求</span>
+                <span>{toolCount} 次工具调用</span>
+              </div>
+            </div>
+            {!events.length ? (
               <div className="empty-state">
-                <span>
-                  <TraceMark size={26} />
-                </span>
-                <h3>运行后查看每一步</h3>
-                <p>模型请求 → 工具调用 → Observation → 下一轮决策</p>
+                <div className="empty-icon">{selectedRun?.status === "running" ? "···" : "{}"}</div>
+                <strong>
+                  {selectedRun?.status === "running"
+                    ? "正在等待模型响应"
+                    : hasRuns
+                      ? "这个架构尚未运行"
+                      : "等待运行"}
+                </strong>
+                <p>运行后查看每一步的输入、决定和结果。</p>
+              </div>
+            ) : (
+              <div className="event-list" aria-live="polite">
+                {events.map((event, index) => {
+                  if (event.type === "plan")
+                    return (
+                      <article className="plan-event" key={index}>
+                        <div className="event-heading">
+                          <span className="plan-chip">计划</span>
+                          <h3>{event.source === "fixed" ? "按规则确定顺序" : "模型制定步骤"}</h3>
+                        </div>
+                        <div className="step-summary">
+                          <div>
+                            <span className="step-label">执行顺序</span>
+                            <strong>
+                              {event.status && event.status >= 400
+                                ? `生成失败（${event.status}）`
+                                : event.steps.length
+                                  ? event.steps.map((step) => step.name).join(" → ")
+                                  : "无需工具"}
+                            </strong>
+                          </div>
+                        </div>
+                        <RawDetails>
+                          {event.source === "model" ? (
+                            <div className="io-grid">
+                              <JsonPanel title="发给模型 · 完整请求" value={event.request} />
+                              <JsonPanel title="模型返回 · 完整响应" value={event.response} />
+                            </div>
+                          ) : (
+                            <JsonPanel title="执行器生成的步骤" value={event.steps} />
+                          )}
+                        </RawDetails>
+                      </article>
+                    );
+                  if (event.type === "model") {
+                    const { query, previousTools, availableTools, calledTools } =
+                      modelSummary(event);
+                    return (
+                      <article className="model-event" key={index}>
+                        <div className="event-heading">
+                          <span className="round-chip">
+                            {event.purpose === "summary" ? "总结" : `第 ${event.round} 轮`}
+                          </span>
+                          <h3>{event.purpose === "summary" ? "模型总结" : "问模型"}</h3>
+                        </div>
+                        <div className="step-summary">
+                          <div>
+                            <span className="step-label">传入</span>
+                            <span>
+                              {previousTools.length
+                                ? `原问题 + ${previousTools.join("、")} 的结果`
+                                : typeof query === "string"
+                                  ? query
+                                  : "用户问题"}
+                            </span>
+                          </div>
+                          {event.purpose !== "summary" ? (
+                            <div>
+                              <span className="step-label">可选工具</span>
+                              <span>
+                                {availableTools.length ? availableTools.join("、") : "无"}
+                              </span>
+                            </div>
+                          ) : null}
+                          <div className="decision-row">
+                            <span className="step-label">
+                              {event.purpose === "summary" ? "输出" : "模型决定"}
+                            </span>
+                            <strong>
+                              {event.status !== 200
+                                ? `请求失败（${event.status}）`
+                                : event.purpose === "summary"
+                                  ? "生成最终回答"
+                                  : calledTools.length
+                                    ? `调用 ${calledTools.join("、")}`
+                                    : "给出最终回答"}
+                            </strong>
+                          </div>
+                        </div>
+                        <RawDetails>
+                          <div className="io-grid">
+                            <JsonPanel title="发给模型 · 完整请求" value={event.request} />
+                            <JsonPanel title="模型返回 · 完整响应" value={event.response} />
+                          </div>
+                        </RawDetails>
+                      </article>
+                    );
+                  }
+                  if (event.type === "tool")
+                    return (
+                      <article className="tool-event" key={index}>
+                        <div className="event-heading">
+                          <span className="tool-chip">工具</span>
+                          <h3>{event.name}</h3>
+                        </div>
+                        <div className="step-summary">
+                          <div>
+                            <span className="step-label">传入参数</span>
+                            <code>{compact(event.arguments)}</code>
+                          </div>
+                          <div>
+                            <span className="step-label">返回结果</span>
+                            <code>
+                              {compact(asRecord(event.observation)?.result ?? event.observation)}
+                            </code>
+                          </div>
+                        </div>
+                        <p className="next-step">结果已记录 → {event.next ?? "再问模型"}</p>
+                        <RawDetails>
+                          <div className="tool-grid">
+                            <JsonPanel title="工具收到的参数" value={event.arguments} />
+                            <JsonPanel title="完整 Observation" value={event.observation} />
+                            <JsonPanel title="写入上下文的消息" value={event.appended_message} />
+                          </div>
+                        </RawDetails>
+                      </article>
+                    );
+                  if (event.type === "final")
+                    return (
+                      <article className="final-event" key={index}>
+                        <span>结束 · {event.reason}</span>
+                        <h3>最终回答</h3>
+                        <p>{event.answer || "模型未返回文字回答"}</p>
+                      </article>
+                    );
+                  return (
+                    <p className="stream-error" role="alert" key={index}>
+                      {event.message}
+                    </p>
+                  );
+                })}
+                {selectedRun?.status === "running" ? (
+                  <p className="running-state">正在等待下一步…</p>
+                ) : null}
               </div>
             )}
-            {running && events.length > 0 ? <p className="running-message">{runningText}</p> : null}
-            {manualSession && !running ? (
-              <div className="manual-gate">
-                <strong>
-                  {manualAction === "execute"
-                    ? "工具尚未执行"
-                    : manualAction === "decide"
-                      ? "模型输入已准备"
-                      : "准备下一轮"}
-                </strong>
-                <p>
-                  {manualAction === "execute"
-                    ? "检查上方参数后继续。"
-                    : "点击继续，查看下一步的可观察结果。"}
-                </p>
-                <Button size="sm" onClick={() => runManual()}>
-                  {manualButtonText}
-                </Button>
-              </div>
-            ) : null}
-          </div>
-          {result ? <ResultPanel result={result} onCopy={copyResult} copied={copied} /> : null}
-          {!running ? (
-            <p className="footer-note">只展示 API 返回的可观察内容，不包含模型内部隐藏思维过程。</p>
-          ) : null}
-        </section>
+          </section>
+        </div>
       </div>
     </main>
   );
