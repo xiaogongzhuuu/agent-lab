@@ -6,11 +6,13 @@ import { TraceFields, TraceInspector, type TraceSelection } from "./components/t
 import { buildTraceLinks, type TraceEvent as AgentEvent } from "@/lib/trace-links";
 import {
   Brain,
+  ClipboardCheck,
   ChevronLeft,
   ChevronRight,
   Minimize2,
   PanelLeftClose,
   PanelLeftOpen,
+  Route,
   Workflow,
 } from "lucide-react";
 
@@ -48,8 +50,10 @@ const architectureNotes: Record<Architecture, string> = {
 
 const modules = [
   { name: "工具调用", icon: Workflow, current: true },
-  { name: "上下文压缩", icon: Minimize2, current: false },
-  { name: "长期记忆", icon: Brain, current: false },
+  { name: "上下文管理", icon: Minimize2, current: false },
+  { name: "记忆管理", icon: Brain, current: false },
+  { name: "规划与执行", icon: Route, current: false },
+  { name: "验证与纠错", icon: ClipboardCheck, current: false },
 ] as const;
 
 const sidebarPreferenceKey = "agent-lab.sidebar-collapsed";
@@ -416,8 +420,8 @@ export default function Home() {
           ↻
         </div>
         <div>
-          <strong>Agent 最小实验台</strong>
-          <span>观察不同架构的调用过程</span>
+          <strong>Agent Lab</strong>
+          <span>智能体实验台</span>
         </div>
         <span className="model-badge">deepseek-chat</span>
       </header>

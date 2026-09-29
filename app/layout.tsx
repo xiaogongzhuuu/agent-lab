@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Agent 最小实验台",
-  description: "配置工具并查看 Agent 每轮完整的模型输入、输出和上下文。",
+  title: "Agent Lab · 智能体实验台",
+  description: "对照智能体架构，追踪模型请求、工具调用与执行结果。",
   other: {
     "codex-preview": "development",
   },
